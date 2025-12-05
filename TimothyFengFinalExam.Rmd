@@ -1,0 +1,272 @@
+---
+title: "TimothyFengFinalExam"
+output: html_document
+date: "2025-12-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(rpart)
+library(caret)
+library(dplyr)
+library(Metrics)
+```
+
+# Load In Data and Process it
+
+```{r}
+Batting <- read.csv("Batting.csv")
+Players <- read.csv("People.csv")
+
+Batting <- Batting %>%
+  select(-G_old, -G_batting, -stint, -GIDP, -SB, -CS)
+
+Players <- Players %>%
+  select(playerID, nameFirst, nameLast, weight, height, bats, throws, birthYear)
+
+df <- Batting %>%
+  left_join(Players, by = "playerID")
+
+df[is.na(df)] <- 0
+
+df <- df %>%
+  mutate(age = yearID - birthYear,
+         XBH = X2B + X3B + HR) %>%
+  filter(bats %in% c("R", "L", "B") & throws %in% c("R", "L", "B") & age <=45)
+
+df <- df %>%
+  mutate(SLG = ((H - XBH) + 2*X2B + 3*X3B + 4*HR)/AB) %>%
+  filter(AB >= 30 & height > 0 & weight > 0)
+
+df <- df %>%
+  mutate(AgeGroup = cut(age,
+                        breaks = c(16, 24, 29, 34, 40, 45),
+                        labels = c("17–24", "25–29", "30–34", "35–39", "40+")))
+
+# Response Variable: HR
+# Predictors: age, AB, H, SO, height, weight, SLG 
+```
+
+
+# EDA & Plots
+
+```{r, fig.width=10, fig.height=8}
+ageHisto <- ggplot(df) +
+  geom_histogram(aes(x = age), color = "black", fill = "firebrick") +
+  labs(title = "Age Of Baseball Players",
+       x = "Age",
+       y = "Number of Players") +
+  theme_minimal()
+
+
+slgso_cor_value <- round(cor(df$SO, df$SLG, use = "complete.obs"), 3)
+SlgSo_plot <- ggplot(df) +
+  geom_jitter(aes(x = SO, y = SLG)) +
+  geom_smooth(aes(x = SO, y = SLG), method = "lm", se = FALSE, color = "firebrick") +
+  annotate("text",
+           x = Inf, y = -Inf,
+           label = paste("Correlation =", slgso_cor_value),
+           hjust = 1.1, vjust = -0.5,
+           size = 5) +
+  theme_minimal() +
+  labs(title = "Correlation Between SLG and SOs")
+
+
+
+hw_cor_value <- round(cor(df$height, df$weight, use = "complete.obs"), 3)
+hw_plot <- ggplot(df) +
+  geom_jitter(aes(x = height, y = weight)) +
+  geom_smooth(aes(x = height, y = weight), method = "lm", se = FALSE, color = "firebrick") +
+  annotate("text",
+           x = Inf, y = -Inf,
+           label = paste("Correlation =", hw_cor_value),
+           hjust = 1.1, vjust = -0.5,
+           size = 5) +
+  theme_minimal() +
+  labs(title = "Height and Weight Correlation",
+       x = "Height",
+       y = "Weight")
+
+slgByAge_plot <- ggplot(df, aes(x = SLG)) +
+  geom_histogram(binwidth = 0.05, fill = "firebrick", color = "white") +
+  facet_wrap(~ AgeGroup, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Distribution of SLG by Age Group",
+       x = "Slugging Percentage (SLG)",
+       y = "Count")
+
+hrso_cor_value <- round(cor(df$HR, df$SO, use = "complete.obs"), 3)
+hrso_plot <- ggplot(df) +
+  geom_jitter(aes(x = HR, y = SO)) +
+  geom_smooth(aes(x = HR, y = SO), method = "lm", se = FALSE, color = "firebrick") +
+  annotate("text",
+           x = Inf, y = -Inf,
+           label = paste("Correlation =", hrso_cor_value),
+           hjust = 1.1, vjust = -0.5,
+           size = 5) +
+  theme_minimal() +
+  labs(title = "Correlation Between HRs and SOs")
+
+agehr_cor_value <- round(cor(df$age, df$HR, use = "complete.obs"), 3)
+hrage_plot <- ggplot(df) +
+  geom_jitter(aes(x = age, y = HR)) +
+  geom_smooth(aes(x = age, y = HR), method = "lm", se = FALSE, color = "firebrick") +
+  annotate("text",
+           x = Inf, y = Inf,
+           label = paste("Correlation =", agehr_cor_value),
+           hjust = 1.1, vjust = 1.1,
+           size = 5) +
+  theme_minimal() +
+  labs(title = "Age and HRs Correlation",
+       x = "Age")
+
+
+dashboard <- (ageHisto | slgByAge_plot) /
+             (SlgSo_plot | hw_plot) /
+             (hrso_plot | hrage_plot)
+
+# Add a dashboard-wide title
+dashboard <- dashboard + 
+  plot_annotation(
+    title = "Baseball Player Statistics Dashboard",
+    theme = theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5))
+  )
+
+dashboard
+
+ggsave("baseball_plots.png", plot = dashboard)
+```
+
+# Predictive Modeling
+
+```{r}
+# Response Variable: HR
+# Predictors: age, AB, H, SO, height, weight, SLG
+
+df_sample <- df %>% sample_n(1000)
+ind <- sample(1:nrow(df_sample), size = nrow(df_sample)*.2)
+df_test <- df_sample[ind,]
+df_train <- df_sample[-ind,]
+
+ctrl <- trainControl(method="cv", number=5)
+
+df_lm <- train(HR ~ AB + H + SO + height + weight + SLG + age, data = df_train,
+                method="lm",
+                trControl=ctrl)
+
+df_tree <- train(HR ~ AB + H + SO + height + weight + SLG + age, data = df_train,
+                  method = "rpart",
+                  trControl=ctrl,
+                  tuneLength=5)
+
+df_rf_small <- train(HR ~ AB + weight + SLG + age, data = df_train,
+                method = "rf", 
+                trControl = ctrl, 
+                ntree = 500, 
+                tuneGrid=expand.grid(mtry=1:4),
+                importance=TRUE)
+
+df_rf <- train(HR ~ AB + H + SO + height + weight + SLG + age, data = df_train,
+                method = "rf", 
+                trControl = ctrl, 
+                ntree = 500, 
+                tuneGrid=expand.grid(mtry=1:4),
+                importance=TRUE)
+
+df_back <- train(HR ~ AB + H + SO + height + weight + SLG + age, data = df_train,
+              method="leapBackward", trControl=ctrl)
+
+df_forward <- train(HR ~ AB + H + SO + height + weight + SLG + age, data = df_train,
+              method="leapForward", trControl=ctrl)
+
+```
+
+## Model Choice Reasoning
+
+I chose the linear model because it is a simple model to use and interpret that also sets a good base line for the models on predicting HRs.
+
+I chose the tree model because it is a more complex model than the LM and is a simple tree that takes more into account than the LM.
+
+I chose the Random Forrest model because it is a really good predictor and is usually accurate as well as it is good with different variable types.
+
+I also chose to use a Random Forrest model with less predictors because I felt that taking the predictors out of this model might help it to perform better.
+
+I chose the backwards and forwards models because it is pretty simple and will help determine which variables are important and which are not.
+
+
+# Model Comparison
+
+```{r}
+lm_predictions <- predict(df_lm, newdata = df_test)
+tree_predictions <- predict(df_tree, newdata = df_test)
+rf_small_predictions <- predict(df_rf_small, newdata = df_test)
+rf_predictions <- predict(df_rf, newdata = df_test)
+back_predictions <- predict(df_back, newdata = df_test)
+forward_predictions <- predict(df_forward, newdata = df_test)
+
+prediction_df <- data.frame(
+  Actual_HR = df_test$HR,
+  lm_Predicted_HR = lm_predictions,
+  tree_Predicted_HR = tree_predictions,
+  rf_small_Predicted_HR = rf_small_predictions,
+  rf_Predicted_HR = rf_predictions,
+  back_Predicted_HR = back_predictions,
+  forward_Predicted_HR = forward_predictions)
+
+compare_df <- prediction_df %>%
+  pivot_longer(cols = c(lm_Predicted_HR, tree_Predicted_HR, rf_small_Predicted_HR, rf_Predicted_HR, back_Predicted_HR, forward_Predicted_HR),
+               names_to = "Model",
+               values_to = "Predicted_HR")
+
+baseball_models <- ggplot(compare_df, aes(x = Actual_HR, y = Predicted_HR, color = Model)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  facet_wrap(~Model) +
+  theme_minimal()
+
+baseball_models
+
+
+evaluate_model <- function(actual, predicted) {
+  rmse <- rmse(actual, predicted)
+  mae  <- mae(actual, predicted)
+  r2   <- R2(predicted, actual) 
+  
+  data.frame(
+    RMSE = rmse,
+    MAE = mae,
+    R2 = r2
+  )
+}
+
+
+lm_metrics   <- evaluate_model(prediction_df$Actual_HR, prediction_df$lm_Predicted_HR)
+tree_metrics <- evaluate_model(prediction_df$Actual_HR, prediction_df$tree_Predicted_HR)
+rf_small_metrics <- evaluate_model(prediction_df$Actual_HR, prediction_df$rf_small_Predicted_HR)
+rf_metrics   <- evaluate_model(prediction_df$Actual_HR, prediction_df$rf_Predicted_HR)
+back_metrics   <- evaluate_model(prediction_df$Actual_HR, prediction_df$back_Predicted_HR)
+forward_metrics   <- evaluate_model(prediction_df$Actual_HR, prediction_df$forward_Predicted_HR)
+
+
+model_metrics <- bind_rows(
+  lm_metrics %>% mutate(Model = "LM"),
+  tree_metrics %>% mutate(Model = "Tree"),
+  rf_small_metrics %>% mutate(Model = "Small RF"),
+  rf_metrics %>% mutate(Model = "RF"),
+  back_metrics %>% mutate(Model = "Backward"),
+  forward_metrics %>% mutate(Model = "Forward"))
+
+model_metrics <- model_metrics %>% select(Model, RMSE, MAE, R2)
+model_metrics
+
+ggsave("baseball_models.png", plot = baseball_models)
+```
+
+## Model Analysis
+
+Looking at the models, it appears that all of the models have similar RMSE, MAE and R^2 scores. The Random Forrest model performed the best on all 3. It had the best RSME value being the only model under 3 meaning that its predictions had the closest values to the actual ones and does not have many significant errors and was the most accurate. It also had the best MAE being the only model under 2 also indicating that it is the most accurate. Finally it had the best R^2 value with .898 meaning that the model explained about 90% of the variability in HRs are explained by the model. Overall, the Random Forrest model performed the best of all of the models and the smaller Random Forrest model was close behind. 
+
+Some limitations of these models are that it does not take into account any hitting metrics like exit velocity, launch angle or bat speed which are important when determining if a batted ball may be a home run. It also does nto take into account park factors as some batted balls could be home runs in some ballparks but not in others. Another limitation is that this data stretches across over 120 years and the game has changed a lot so using data from guys who played in the early 1900s will probably not help determine number of home runs today. If I had more resources and time, I would use exit velocity, launch angle and bat speed as well as park factors to help improve this model. 
